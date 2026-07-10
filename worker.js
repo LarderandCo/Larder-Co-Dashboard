@@ -79,22 +79,65 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    /* QuickBooks Online - verified against Intuit's current docs (Jul 2026).
+       Production keys created straight from the app's Production > Keys & OAuth
+       tab (no App Store review needed for the owner's own company). */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://appcenter.intuit.com/connect/oauth2',
+      tokenUrl: 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
+      scopes: 'com.intuit.quickbooks.accounting',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic' /* Intuit's token endpoint wants HTTP Basic client auth */
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token || !tokens.realmId) return { connected: false };
+      const info = await h.fetchJson(
+        QBO_BASE + tokens.realmId + '/companyinfo/' + tokens.realmId + '?minorversion=75',
+        { headers: { Accept: 'application/json' } }
+      );
+      const name = (info && info.CompanyInfo && info.CompanyInfo.CompanyName) || '';
+      /* Sandbox risk: Intuit's auto-provisioned test companies are named like
+         "Sandbox Company_US_1" - flag so the AI steers the owner to their real one. */
+      return { connected: true, org: name, sandbox: /sandbox company/i.test(name) };
+    },
+    async fetchRange(env, h, q) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.realmId) throw new NotConfigured('accounting');
+      const report = await h.fetchJson(
+        QBO_BASE + tokens.realmId + '/reports/ProfitAndLoss?minorversion=75'
+          + '&start_date=' + q.from + '&end_date=' + q.to,
+        { headers: { Accept: 'application/json' } }
+      );
+      const s = sumQBOReport(report);
+      return { revenue: s.revenue, cogs: s.cogs, wagesSuper: s.wagesSuper, overheads: s.overheads };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const tokens = await h.getTokens();
+      const revenue = [], cogs = [], wagesSuper = [], overheads = [];
+      for (const mo of months) {
+        if (!tokens || !tokens.realmId) { revenue.push(null); cogs.push(null); wagesSuper.push(null); overheads.push(null); continue; }
+        const [y, m] = mo.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const from = mo + '-01', to = mo + '-' + String(lastDay).padStart(2, '0');
+        try {
+          const report = await h.fetchJson(
+            QBO_BASE + tokens.realmId + '/reports/ProfitAndLoss?minorversion=75'
+              + '&start_date=' + from + '&end_date=' + to,
+            { headers: { Accept: 'application/json' } }
+          );
+          const s = sumQBOReport(report);
+          revenue.push(s.revenue); cogs.push(s.cogs); wagesSuper.push(s.wagesSuper); overheads.push(s.overheads);
+        } catch (e) {
+          revenue.push(null); cogs.push(null); wagesSuper.push(null); overheads.push(null);
+        }
+      }
+      return { months, revenue, cogs, wagesSuper, overheads };
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -144,6 +187,59 @@ const ADAPTERS = {
 
 class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
+}
+
+/* ---------------- QuickBooks Online: P&L report parsing (kpi-spec.md is the law) ----
+   QBO's ProfitAndLoss report shape: Rows.Row[], each a section carrying a `group`
+   field ("Income" | "COGS" | "Expenses" | others), a Header.ColData[0].value label,
+   a Summary.ColData[] total (last cell is the amount), and its own nested Rows.Row[]
+   line items. This mirrors Xero's Section/Cells shape with different field names -
+   see capability-matrix.md's worked example. */
+const QBO_BASE = 'https://quickbooks.api.intuit.com/v3/company/';
+const WAGE_KEYWORDS = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+
+function qboRows(node) {
+  if (!node || !node.Row) return [];
+  return Array.isArray(node.Row) ? node.Row : [node.Row];
+}
+function qboAmount(colData) {
+  if (!colData || !colData.length) return 0;
+  const v = parseFloat(colData[colData.length - 1].value);
+  return isFinite(v) ? v : 0;
+}
+function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
+
+/* Revenue = Income section total (trading income only). Cost of goods = COGS
+   section total. Wages+super = keyword-matched lines inside Expenses (owner
+   confirms the exact list at reconciliation - kpi-spec.md #5). Overheads =
+   Expenses total minus those matched lines. */
+function sumQBOReport(report) {
+  const top = qboRows(report && report.Rows);
+  let revenue = 0, cogsTotal = 0, expensesTotal = 0, wagesSuper = 0;
+  const wageLines = [];
+  for (const row of top) {
+    const group = (row.group || '').toLowerCase();
+    const headerText = ((row.Header && row.Header.ColData && row.Header.ColData[0] && row.Header.ColData[0].value) || '').toLowerCase();
+    const total = row.Summary ? qboAmount(row.Summary.ColData) : 0;
+    if (group === 'income' || headerText === 'income') {
+      revenue += total;
+    } else if (group === 'cogs' || headerText.indexOf('cost of goods sold') !== -1 || headerText.indexOf('cost of sales') !== -1) {
+      cogsTotal += total;
+    } else if (group === 'expense' || group === 'expenses' || headerText === 'expenses') {
+      expensesTotal += total;
+      for (const line of qboRows(row.Rows)) {
+        const label = (line.ColData && line.ColData[0] && line.ColData[0].value) || '';
+        if (WAGE_KEYWORDS.test(label)) { wagesSuper += qboAmount(line.ColData); wageLines.push(label); }
+      }
+    }
+  }
+  return {
+    revenue: round2(revenue),
+    cogs: round2(cogsTotal),
+    wagesSuper: round2(wagesSuper),
+    overheads: round2(expensesTotal - wagesSuper),
+    wageLines
+  };
 }
 
 const PLAIN_ERRORS = {
@@ -479,7 +575,10 @@ async function authCallback(env, source, url) {
     refresh_token: t.refresh_token || null,
     token_type: t.token_type || 'Bearer',
     expires_at: Date.now() + ((t.expires_in || 1800) * 1000),
-    obtained_at: new Date().toISOString()
+    obtained_at: new Date().toISOString(),
+    /* QuickBooks returns realmId (the company id) alongside code/state on the
+       accounting/payments scopes; harmless no-op for adapters that don't use it. */
+    realmId: url.searchParams.get('realmId') || null
   });
   /* After token storage, adapters' status() should resolve org name etc. */
   return Response.redirect(url.origin + '/', 302);
