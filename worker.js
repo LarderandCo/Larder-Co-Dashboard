@@ -347,7 +347,12 @@ function makeHelpers(env, source) {
         if (t) { t.expires_at = 0; await saveTokens(env, source, t); } /* force refresh */
         res = await doFetch();
       }
-      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+      if (!res.ok) {
+        const e = new Error('HTTP ' + res.status); e.status = res.status;
+        const tid = res.headers.get('intuit_tid') || res.headers.get('intuit-tid');
+        if (tid) { e.intuitTid = tid; console.log('QuickBooks error, intuit_tid=' + tid + ' status=' + res.status); }
+        throw e;
+      }
       return res.json();
     }
   };
@@ -834,12 +839,29 @@ function json(obj, status) {
   });
 }
 
+const PRIVACY_TEXT = 'Privacy Policy - Venue Dashboard\n'
+  + '================================\n\n'
+  + 'This dashboard is a private, single-business tool built for and used by one venue owner. It is not offered publicly and has no other customers or users.\n\n'
+  + 'What it accesses: read-only financial reports from the owner\u2019s own QuickBooks Online company, and read-only transaction counts from the owner\u2019s own Square account. It never writes to, modifies, or deletes any data in either system.\n\n'
+  + 'What it stores: OAuth connection tokens (to keep the connection working) and the metric figures shown on the dashboard, stored in the owner\u2019s own Cloudflare account. Nothing is shared with, sold to, or made accessible to any third party.\n\n'
+  + 'Who can see the data: only the owner, via a password-protected dashboard that only they control.\n\n'
+  + 'Contact: this tool is maintained directly by the owner and their AI assistant; there is no separate support address.';
+
+const TERMS_TEXT = 'Terms of Use - Venue Dashboard\n'
+  + '==============================\n\n'
+  + 'This dashboard is a private tool built for one venue\u2019s own use. It is not distributed, licensed, or made available to any other business or user.\n\n'
+  + 'It connects, read-only, to the owner\u2019s own QuickBooks Online and Square accounts to display the owner\u2019s own business metrics. It never writes to or changes data in either connected system.\n\n'
+  + 'The owner may disconnect any connected account at any time from the dashboard\u2019s Connections screen, which immediately stops all further access.';
+
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
     if (path === '/favicon.ico') return new Response(null, { status: 204 });
+    if (path === '/privacy') return new Response(PRIVACY_TEXT, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+    if (path === '/terms') return new Response(TERMS_TEXT, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
     if (path === '/api/login' && request.method === 'POST') return apiLogin(env, request);
     if (path === '/api/setup' && request.method === 'POST') return apiSetup(env, request);
     if (path === '/api/logout' && request.method === 'POST') return apiLogout();
