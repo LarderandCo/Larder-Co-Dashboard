@@ -350,7 +350,15 @@ function makeHelpers(env, source) {
       if (!res.ok) {
         const e = new Error('HTTP ' + res.status); e.status = res.status;
         const tid = res.headers.get('intuit_tid') || res.headers.get('intuit-tid');
-        if (tid) { e.intuitTid = tid; console.log('QuickBooks error, intuit_tid=' + tid + ' status=' + res.status); }
+        if (tid) e.intuitTid = tid;
+        try {
+          const body = await res.text();
+          e.detail = body.slice(0, 500);
+          const parsed = JSON.parse(body);
+          const fault = parsed && parsed.Fault && parsed.Fault.Error && parsed.Fault.Error[0];
+          if (fault) e.detail = (fault.code ? ('code ' + fault.code + ': ') : '') + (fault.Message || '') + (fault.Detail ? (' - ' + fault.Detail) : '');
+        } catch (parseErr) { /* body wasn't JSON or was empty - e.detail stays as raw text if set */ }
+        console.log('QuickBooks error status=' + res.status + ' intuit_tid=' + (tid || 'none') + ' detail=' + (e.detail || 'none'));
         throw e;
       }
       return res.json();
@@ -716,7 +724,7 @@ async function sourceStatus(env, source) {
       org: null,
       sandbox: false,
       lastSync: (await lastSync(env, source)) || null,
-      error: { code: err.status || 0, plain: plainError(err.status || 500) }
+      error: { code: err.status || 0, plain: plainError(err.status || 500) + (err.detail ? (' [' + err.detail + ']') : '') }
     };
   }
 }
